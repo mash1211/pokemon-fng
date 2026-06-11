@@ -290,3 +290,182 @@ export async function listSubscriptions() {
   if (!res.ok) throw new Error(`List subscriptions ${res.status}`);
   return res.json();
 }
+
+// ─── Top Movers from eBay sold listings ───────────────────────────────────────
+export interface EbayMover {
+  id: string;
+  name: string;
+  set: string;
+  condition: string;
+  imageUrl: string;
+  itemWebUrl: string;
+  price: number;
+  change24h: number;
+  change7d: number;
+  change30d: number;
+  volume: number;
+  spark: number[];
+  category: string;
+  live: boolean;
+}
+
+const MOVER_QUERIES = [
+  'pokemon card illustration rare psa',
+  'pokemon card special illustration rare',
+  'pokemon card charizard holo psa 10',
+  'pokemon card vintage base set holo',
+  'pokemon card hyper rare',
+  'pokemon booster box sealed',
+];
+
+function cleanTitle(title: string): string {
+  return title
+    .replace(/\b(PSA|BGS|CGC)\s*\d+(\.\d+)?\b/gi, '')
+    .replace(/\b(graded|mint|nm|pack fresh|raw|sealed|booster|box|lot|bundle)\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60);
+}
+
+function extractSet(title: string): string {
+  const sets = [
+    'Obsidian Flames', 'Paradox Rift', 'Paldea Evolved', 'Scarlet & Violet',
+    '151', 'Crown Zenith', 'Silver Tempest', 'Lost Origin', 'Astral Radiance',
+    'Brilliant Stars', 'Fusion Strike', 'Evolving Skies', 'Chilling Reign',
+    'Battle Styles', 'Shining Fates', 'Base Set', 'Jungle', 'Fossil',
+    'Team Rocket', 'Gym Heroes', 'Neo Genesis', 'Temporal Forces',
+    'Twilight Masquerade', 'Shrouded Fable', 'Stellar Crown',
+  ];
+  for (const set of sets) {
+    if (title.toLowerCase().includes(set.toLowerCase())) return set;
+  }
+  return 'Pokémon TCG';
+}
+
+interface GroupedCard {
+  title: string;
+  sales: Array<{ price: number; date: Date; imageUrl: string; itemWebUrl: string; condition: string }>;
+}
+
+export async function getEbayMovers(): Promise<{ gainers: EbayMover[]; losers: EbayMover[]; live: boolean }> {
+  try {
+    const appId = process.env.EBAY_CLIENT_ID;
+    if (!appId) throw new Error('EBAY_CLIENT_ID required');
+
+    const now = new Date();
+    const ago24h = new Date(now.getTime() -  1 * 86400000);
+    const ago7d  = new Date(now.getTime() -  7 * 86400000);
+    const ago30d = new Date(now.getTime() - 30 * 86400000);
+
+    // Fetch sold listings for each query in parallel
+    const results = await Promise.allSettled(
+      MOVER_QUERIES.map(q => getSoldListings(q, 30, 100))
+    );
+
+    const allSold: SoldListing[] = results
+      .filter((r): r is PromiseFulfilledResult<SoldListing[]> => r.status === 'fulfilled')
+      .flatMap(r => r.value)
+      .filter(s => s.soldPrice > 5);
+
+    if (allSold.length < 5) throw new Error('insufficient sold data');
+
+    // Fetch active listings for images and URLs
+    const activeResults = await Promise.allSettled(
+      MOVER_QUERIES.slice(0, 3).map(q => searchActiveListings(q, 20))
+    );
+    const activeListings: EbayListing[] = activeResults
+      .filter((r): r is PromiseFulfilledResult<EbayListing[]> => r.status === 'fulfilled')
+      .flatMap(r => r.value);
+
+    // Build image/URL lookup from active listings
+    const imageMap = new Map<string, { imageUrl: string; itemWebUrl: string }>();
+    for (const listing of activeListings) {
+      const key = cleanTitle(listing.title).toLowerCase().slice(0, 20);
+      if (!imageMap.has(key) && listing.imageUrl) {
+        imageMap.set(key, { imageUrl: listing.imageUrl, itemWebUrl: listing.itemWebUrl });
+      }
+    }
+
+    // Group sales by cleaned card name
+    const groups = new Map<string, GroupedCard>();
+    for (const sale of allSold) {
+      const key = cleanTitle(sale.title).toLowerCase().slice(0, 30);
+      if (!groups.has(key)) {
+        groups.set(key, { title: cleanTitle(sale.title), sales: [] });
+      }
+      groups.get(key)!.sales.push({
+        price:      sale.soldPrice,
+        date:       new Date(sale.soldDate),
+        imageUrl:   '',
+        itemWebUrl: '',
+        condition:  sale.condition,
+      });
+    }
+
+    // Calculate price changes per group
+    const movers: EbayMover[] = [];
+
+    for (const [key, group] of groups) {
+      if (group.sales.length < 2) continue;
+
+      const sorted = [...group.sales].sort((a, b) => b.date.getTime() - a.date.getTime());
+      const avg = (sales: typeof sorted) =>
+        sales.length ? sales.reduce((s, x) => s + x.price, 0) / sales.length : 0;
+
+      const recent7d  = sorted.filter(s => s.date >= ago7d);
+      const older7d   = sorted.filter(s => s.date < ago24h && s.date >= ago7d);
+      const older30d  = sorted.filter(s => s.date < ago7d  && s.date >= ago30d);
+
+      const currentPrice = avg(recent7d.length ? recent7d : sorted.slice(0, 3));
+      if (currentPrice === 0) continue;
+
+      const avg24hBase = avg(older7d.length ? older7d : sorted.slice(3, 6));
+      const avg7dBase  = avg(older30d.length ? older30d : sorted.slice(Math.floor(sorted.length / 2)));
+      const avg30dBase = avg(sorted.slice(-Math.ceil(sorted.length / 3)));
+
+      const pct = (curr: number, base: number) =>
+        base > 0 ? Math.round(((curr - base) / base) * 1000) / 10 : 0;
+
+      // Build 7-day sparkline
+      const spark: number[] = [];
+      for (let day = 6; day >= 0; day--) {
+        const dayStart = new Date(now.getTime() - day * 86400000);
+        const dayEnd   = new Date(now.getTime() - (day - 1) * 86400000);
+        const daySales = sorted.filter(s => s.date >= dayStart && s.date < dayEnd);
+        spark.push(daySales.length ? Math.round(avg(daySales) * 100) / 100 : currentPrice);
+      }
+
+      const imgKey = key.slice(0, 20);
+      const imgData = imageMap.get(imgKey) ?? { imageUrl: '', itemWebUrl: '' };
+
+      movers.push({
+        id:         key,
+        name:       group.title,
+        set:        extractSet(group.title),
+        condition:  sorted[0].condition,
+        imageUrl:   imgData.imageUrl,
+        itemWebUrl: imgData.itemWebUrl,
+        price:      Math.round(currentPrice * 100) / 100,
+        change24h:  pct(currentPrice, avg24hBase),
+        change7d:   pct(currentPrice, avg7dBase),
+        change30d:  pct(currentPrice, avg30dBase),
+        volume:     sorted.filter(s => s.date >= ago30d).length,
+        spark,
+        category:   group.title.toLowerCase().includes('sealed') || group.title.toLowerCase().includes('box') ? 'Sealed' : 'Singles',
+        live:       true,
+      });
+    }
+
+    const sortedMovers = [...movers].sort((a, b) => b.change30d - a.change30d);
+    console.log(`[eBay Movers] ${movers.length} cards tracked`);
+
+    return {
+      gainers: sortedMovers.slice(0, 10),
+      losers:  [...sortedMovers].reverse().slice(0, 10),
+      live:    true,
+    };
+  } catch (err) {
+    console.warn('[eBay Movers] Fallback:', (err as Error).message);
+    return { gainers: [], losers: [], live: false };
+  }
+}
