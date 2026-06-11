@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getSocialBuzz } from '@/app/lib/social';
-import { getEbayMarketSignals } from '@/app/lib/ebay';
+import { getEbayMarketSignals, getEbayMovers } from '@/app/lib/ebay';
 
 // ─── Weight spec (from product requirements) ──────────────────────────────────
 const WEIGHTS = {
@@ -65,12 +65,13 @@ export interface CardMover {
   set: string;
   rarity: string;
   imageUrl: string;
+  itemWebUrl?: string;    // eBay listing URL (present when live)
   price: number;
   change24h: number;
   change7d: number;
   change30d: number;
-  volume: number;          // sales count in period
-  spark: number[];         // 7 data points for mini sparkline
+  volume: number;
+  spark: number[];
   category: string;
 }
 
@@ -100,6 +101,7 @@ export interface IndexData {
   drivers: Driver[];
   gainers: CardMover[];
   losers: CardMover[];
+  ebayLive: boolean;      // true = movers are from real eBay sold data
   history: HistoryPoint[];
   comparison: ScoreComparison[];
   marketSummary: string;
@@ -320,54 +322,57 @@ async function driverVolatility(): Promise<Pick<Driver,'score'|'value'|'historic
   }
 }
 
-// ─── Card movers ──────────────────────────────────────────────────────────────
-async function fetchMovers(): Promise<{gainers:CardMover[];losers:CardMover[]}> {
+// ─── Card movers — real eBay sold data with PokéTCG fallback ──────────────────
+async function fetchMovers(): Promise<{gainers:CardMover[];losers:CardMover[];live:boolean}> {
+  // Try live eBay sold listings first
+  const ebay = await getEbayMovers();
+
+  if (ebay.live && (ebay.gainers.length > 0 || ebay.losers.length > 0)) {
+    const toCardMover = (m: typeof ebay.gainers[0]): CardMover => ({
+      id:         m.id,
+      name:       m.name,
+      set:        m.set,
+      rarity:     m.condition,
+      imageUrl:   m.imageUrl,
+      itemWebUrl: m.itemWebUrl,
+      price:      m.price,
+      change24h:  m.change24h,
+      change7d:   m.change7d,
+      change30d:  m.change30d,
+      volume:     m.volume,
+      spark:      m.spark,
+      category:   m.category,
+    });
+    return {
+      gainers: ebay.gainers.map(toCardMover),
+      losers:  ebay.losers.map(toCardMover),
+      live:    true,
+    };
+  }
+
+  // Fall back to PokéTCG CardMarket prices
   try {
     const [modern, vintage] = await Promise.all([
       tcg('/cards?q=rarity:"Special Illustration Rare" OR rarity:"Illustration Rare"&orderBy=-cardmarket.prices.averageSellPrice&pageSize=20&select=id,name,set,rarity,images,cardmarket'),
       tcg('/cards?q=set.series:"Base"&orderBy=-cardmarket.prices.averageSellPrice&pageSize=8&select=id,name,set,rarity,images,cardmarket'),
     ]);
-
     type Raw={id:string;name:string;set:{name:string};rarity:string;images:{small:string};cardmarket?:{prices?:{averageSellPrice?:number;avg1?:number;avg7?:number;avg30?:number}}};
     const toMover=(c:Raw,cat:string):CardMover|null=>{
       const p=c.cardmarket?.prices;
       if(!p?.averageSellPrice||!p.avg30) return null;
       const price=p.averageSellPrice;
-      const avg7=p.avg7??price;
-      const avg30=p.avg30;
-      const ch24 = p.avg1 ? ((price-p.avg1)/p.avg1)*100 : (Math.random()-0.5)*8;
-      const ch7  = ((price-avg7)/avg7)*100;
-      const ch30 = ((price-avg30)/avg30)*100;
-      const rng = seeded(c.id.charCodeAt(0)*31+c.id.charCodeAt(1));
-      const spark = Array.from({length:7},()=>Math.round(price*(0.9+rng()*0.2)));
-      return {
-        id: c.id,
-        name: c.name,
-        set: c.set?.name??'',
-        rarity: c.rarity??'',
-        imageUrl: c.images?.small??'',
-        price,
-        change24h: Math.round(ch24*10)/10,
-        change7d:  Math.round(ch7*10)/10,
-        change30d: Math.round(ch30*10)/10,
-        volume: Math.round(20+rng()*80),
-        spark,
-        category: cat,
-      };
+      const avg7=p.avg7??price, avg30=p.avg30;
+      const ch24=p.avg1?((price-p.avg1)/p.avg1)*100:(Math.random()-0.5)*8;
+      const ch7=((price-avg7)/avg7)*100, ch30=((price-avg30)/avg30)*100;
+      const rng=seeded(c.id.charCodeAt(0)*31+c.id.charCodeAt(1));
+      const spark=Array.from({length:7},()=>Math.round(price*(0.9+rng()*0.2)));
+      return {id:c.id,name:c.name,set:c.set?.name??'',rarity:c.rarity??'',imageUrl:c.images?.small??'',price,change24h:Math.round(ch24*10)/10,change7d:Math.round(ch7*10)/10,change30d:Math.round(ch30*10)/10,volume:Math.round(20+rng()*80),spark,category:cat};
     };
-
-    const all: CardMover[] = [
-      ...(modern.data??[]).map((c:Raw)=>toMover(c,'Modern')),
-      ...(vintage.data??[]).map((c:Raw)=>toMover(c,'Vintage')),
-    ].filter(Boolean) as CardMover[];
-
-    const sorted30 = [...all].sort((a,b)=>b.change30d-a.change30d);
-    return {
-      gainers: sorted30.slice(0,10),
-      losers:  [...sorted30].reverse().slice(0,10),
-    };
+    const all:CardMover[]=[...(modern.data??[]).map((c:Raw)=>toMover(c,'Modern')),...(vintage.data??[]).map((c:Raw)=>toMover(c,'Vintage'))].filter(Boolean) as CardMover[];
+    const sorted30=[...all].sort((a,b)=>b.change30d-a.change30d);
+    return {gainers:sorted30.slice(0,10),losers:[...sorted30].reverse().slice(0,10),live:false};
   } catch {
-    return { gainers: getFallbackMovers(true), losers: getFallbackMovers(false) };
+    return {gainers:getFallbackMovers(true),losers:getFallbackMovers(false),live:false};
   }
 }
 
@@ -518,6 +523,7 @@ export async function GET() {
       score, label, color, drivers,
       gainers: movers.gainers,
       losers:  movers.losers,
+      ebayLive: movers.live,
       history, comparison,
       marketSummary: buildSummary(score, label, drivers),
       lastUpdated: new Date().toISOString(),
