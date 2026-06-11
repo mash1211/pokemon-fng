@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 
 /**
- * eBay Marketplace Account Deletion endpoint.
+ * eBay Marketplace Account Deletion endpoint. 
  *
  * eBay REQUIRES this endpoint for all apps using their API.
  * It must:
