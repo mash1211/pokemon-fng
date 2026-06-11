@@ -11,7 +11,7 @@ import crypto from 'crypto';
  *
  * Set this URL in eBay Developer Portal:
  *   Alerts & Notifications → Marketplace Account Deletion
- *   Endpoint: https://your-site.vercel.app/api/ebay-deletion
+ *   Endpoint: https://pokemon-fngv2.vercel.app/api/ebay-deletion
  *   Verification Token: must match EBAY_VERIFICATION_TOKEN in your env vars
  */
 
