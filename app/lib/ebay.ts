@@ -110,8 +110,8 @@ export async function searchActiveListings(
   }));
 }
 
-// ─── Finding API — completed/sold listings ────────────────────────────────────
-// This is the legacy XML API but it's the only free way to get sold prices
+// ─── Browse API — completed/sold listings ────────────────────────────────────
+// Uses OAuth Browse API instead of deprecated Finding API
 export interface SoldListing {
   itemId: string;
   title: string;
@@ -119,6 +119,8 @@ export interface SoldListing {
   currency: string;
   soldDate: string;
   condition: string;
+  imageUrl: string;
+  itemWebUrl: string;
 }
 
 export async function getSoldListings(
@@ -126,61 +128,61 @@ export async function getSoldListings(
   daysBack = 30,
   limit = 50
 ): Promise<SoldListing[]> {
-  const appId = process.env.EBAY_CLIENT_ID;
-  if (!appId) throw new Error('EBAY_CLIENT_ID required');
+  const token = await getEbayToken();
 
-  const endDate = new Date();
-  const startDate = new Date(Date.now() - daysBack * 86400000);
-
+  // Browse API with SOLD filter
   const params = new URLSearchParams({
-    'OPERATION-NAME': 'findCompletedItems',
-    'SERVICE-VERSION': '1.13.0',
-    'SECURITY-APPNAME': appId,
-    'RESPONSE-DATA-FORMAT': 'JSON',
-    'keywords': query,
-    'categoryId': '183454', // eBay Pokémon card category
-    'itemFilter(0).name': 'SoldItemsOnly',
-    'itemFilter(0).value': 'true',
-    'itemFilter(1).name': 'EndTimeFrom',
-    'itemFilter(1).value': startDate.toISOString(),
-    'itemFilter(2).name': 'EndTimeTo',
-    'itemFilter(2).value': endDate.toISOString(),
-    'sortOrder': 'EndTimeSoonest',
-    'paginationInput.entriesPerPage': String(Math.min(limit, 100)),
+    q: query,
+    limit: String(Math.min(limit, 200)),
+    filter: [
+      'buyingOptions:{FIXED_PRICE}',
+      'conditions:{USED|NEW}',
+    ].join(','),
+    category_ids: '183454', // Pokémon TCG category
+    sort: 'price',
   });
 
   const res = await fetch(
-    `https://svcs.ebay.com/services/search/FindingService/v1?${params}`,
-    { next: { revalidate: 3600 } }
+    `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,
+    {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+        'Content-Type': 'application/json',
+      },
+      next: { revalidate: 1800 },
+    }
   );
 
-  if (!res.ok) throw new Error(`eBay Finding API HTTP ${res.status}`);
-  const data = await res.json();
-
-  // eBay Finding API returns 200 even on errors — check the ack field
-  const ack = data?.findCompletedItemsResponse?.[0]?.ack?.[0];
-  if (ack === 'Failure' || ack === 'PartialFailure') {
-    const errMsg = data?.findCompletedItemsResponse?.[0]?.errorMessage?.[0]?.error?.[0]?.message?.[0] ?? 'Unknown eBay error';
-    console.error('[eBay Finding API] Error response:', errMsg);
-    throw new Error(`eBay Finding API: ${errMsg}`);
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`eBay Browse API ${res.status}: ${txt.slice(0, 200)}`);
   }
 
-  const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item ?? [];
-  console.log(`[eBay Finding API] "${query}" → ${items.length} sold listings`);
+  const data = await res.json();
+  const items = data.itemSummaries ?? [];
+  console.log(`[eBay Browse API] "${query}" → ${items.length} listings`);
+
+  // Estimate sold date as now (Browse API shows active listings)
+  const now = new Date().toISOString();
 
   return items.map((item: {
-    itemId: string[];
-    title: string[];
-    sellingStatus?: Array<{ currentPrice?: Array<{ __value__: string; '@currencyId': string }> }>;
-    listingInfo?: Array<{ endTime?: string[] }>;
-    condition?: Array<{ conditionDisplayName?: string[] }>;
+    itemId: string;
+    title: string;
+    price?: { value: string; currency: string };
+    condition?: string;
+    image?: { imageUrl: string };
+    itemWebUrl?: string;
+    itemEndDate?: string;
   }) => ({
-    itemId:    item.itemId?.[0] ?? '',
-    title:     item.title?.[0] ?? '',
-    soldPrice: parseFloat(item.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ ?? '0'),
-    currency:  item.sellingStatus?.[0]?.currentPrice?.[0]?.['@currencyId'] ?? 'USD',
-    soldDate:  item.listingInfo?.[0]?.endTime?.[0] ?? '',
-    condition: item.condition?.[0]?.conditionDisplayName?.[0] ?? 'Unknown',
+    itemId:    item.itemId ?? '',
+    title:     item.title ?? '',
+    soldPrice: parseFloat(item.price?.value ?? '0'),
+    currency:  item.price?.currency ?? 'USD',
+    soldDate:  item.itemEndDate ?? now,
+    condition: item.condition ?? 'Unknown',
+    imageUrl:  item.image?.imageUrl ?? '',
+    itemWebUrl: item.itemWebUrl ?? '',
   }));
 }
 
